@@ -18,7 +18,7 @@ public:
     void stop();
 
 private:
-    void handleRoute(const Route& route);
+    void handleMultipleRoutes(const std::vector<Route>& routes);
     
     void handleClient(int clientSocket, const Route& route);
     

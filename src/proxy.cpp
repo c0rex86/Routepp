@@ -9,6 +9,8 @@
 #include <netdb.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <map>
+#include <vector>
 
 #define BUFFER_SIZE 8192
 
@@ -37,8 +39,15 @@ bool RouteProxy::start()
 
     m_running = true;
 
+    // Группируем маршруты по портам
+    std::map<int, std::vector<Route>> routesByPort;
     for (const auto& route : routes) {
-        m_threads.emplace_back(&RouteProxy::handleRoute, this, route);
+        routesByPort[route.sourcePort].push_back(route);
+    }
+
+    // Создаем поток для каждого уникального порта
+    for (const auto& portRoutes : routesByPort) {
+        m_threads.emplace_back(&RouteProxy::handleMultipleRoutes, this, portRoutes.second);
     }
 
     std::cout << "Сервер успешно запущен" << std::endl;
@@ -71,8 +80,15 @@ void RouteProxy::stop()
     std::cout << "Сервер остановлен" << std::endl;
 }
 
-void RouteProxy::handleRoute(const Route& route)
+// Обработка нескольких маршрутов на одном порту
+void RouteProxy::handleMultipleRoutes(const std::vector<Route>& routes)
 {
+    if (routes.empty()) {
+        return;
+    }
+
+    int port = routes[0].sourcePort;
+    
     int serverSocket = socket(AF_INET, SOCK_STREAM, 0);
     if (serverSocket < 0) {
         std::cerr << "Ошибка при создании сокета: " << strerror(errno) << std::endl;
@@ -85,46 +101,18 @@ void RouteProxy::handleRoute(const Route& route)
         close(serverSocket);
         return;
     }
-    
-    if (setsockopt(serverSocket, IPPROTO_IP, IP_TRANSPARENT, &opt, sizeof(opt)) < 0) {
-        std::cerr << "Предупреждение: Не удалось установить IP_TRANSPARENT: " << strerror(errno) << std::endl;
-    }
 
+    // Привязываемся к адресу 0.0.0.0 для приема всех подключений на данном порту
     struct sockaddr_in serverAddr;
     memset(&serverAddr, 0, sizeof(serverAddr));
     serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons(route.sourcePort);
+    serverAddr.sin_port = htons(port);
+    serverAddr.sin_addr.s_addr = INADDR_ANY;
     
-    if (route.sourceIP == "0.0.0.0" || route.sourceIP == "*") {
-        serverAddr.sin_addr.s_addr = INADDR_ANY;
-        std::cout << "Прослушивание на всех интерфейсах (0.0.0.0) на порту " << route.sourcePort << std::endl;
-    } else {
-        if (inet_pton(AF_INET, route.sourceIP.c_str(), &serverAddr.sin_addr) <= 0) {
-            std::cerr << "Неверный IP-адрес: " << route.sourceIP << std::endl;
-            close(serverSocket);
-            return;
-        }
-    }
-
     if (bind(serverSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
-        std::cerr << "Ошибка при привязке сокета к " << route.sourceIP << ":" 
-                  << route.sourcePort << ": " << strerror(errno) << std::endl;
-        std::cerr << "Попытка прослушивания на 0.0.0.0 (все интерфейсы) вместо " << route.sourceIP << std::endl;
-        
-        memset(&serverAddr, 0, sizeof(serverAddr));
-        serverAddr.sin_family = AF_INET;
-        serverAddr.sin_port = htons(route.sourcePort);
-        serverAddr.sin_addr.s_addr = INADDR_ANY;
-        
-        if (bind(serverSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
-            std::cerr << "Ошибка при привязке сокета к 0.0.0.0:" 
-                      << route.sourcePort << ": " << strerror(errno) << std::endl;
-            close(serverSocket);
-            return;
-        } else {
-            std::cout << "Успешная привязка к 0.0.0.0:" << route.sourcePort << " вместо " 
-                      << route.sourceIP << ":" << route.sourcePort << std::endl;
-        }
+        std::cerr << "Ошибка при привязке сокета к 0.0.0.0:" << port << ": " << strerror(errno) << std::endl;
+        close(serverSocket);
+        return;
     }
 
     if (listen(serverSocket, 10) < 0) {
@@ -133,8 +121,12 @@ void RouteProxy::handleRoute(const Route& route)
         return;
     }
 
-    std::cout << "Прослушивание " << route.sourceIP << ":" << route.sourcePort 
-              << " -> " << route.destDomain << ":" << route.destPort << std::endl;
+    // Выводим информацию о всех маршрутах на этом порту
+    std::cout << "Прослушивание порта " << port << " для следующих маршрутов:" << std::endl;
+    for (const auto& route : routes) {
+        std::cout << "  " << route.sourceIP << ":" << route.sourcePort 
+                  << " -> " << route.destDomain << ":" << route.destPort << std::endl;
+    }
 
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -154,12 +146,48 @@ void RouteProxy::handleRoute(const Route& route)
             break;
         }
 
+        // Получаем IP клиента и адрес назначения
         char clientIP[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &clientAddr.sin_addr, clientIP, INET_ADDRSTRLEN);
-        std::cout << "Принято соединение от " << clientIP << ":" << ntohs(clientAddr.sin_port) << std::endl;
 
-        std::thread clientThread(&RouteProxy::handleClient, this, clientSocket, route);
-        clientThread.detach();
+        // Определяем адрес назначения (destination IP), к которому подключился клиент
+        struct sockaddr_in destAddr;
+        socklen_t destAddrLen = sizeof(destAddr);
+        if (getsockname(clientSocket, (struct sockaddr*)&destAddr, &destAddrLen) < 0) {
+            std::cerr << "Ошибка при получении адреса назначения: " << strerror(errno) << std::endl;
+            close(clientSocket);
+            continue;
+        }
+
+        char destIP[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &destAddr.sin_addr, destIP, INET_ADDRSTRLEN);
+        
+        std::cout << "Принято соединение от " << clientIP << ":" << ntohs(clientAddr.sin_port) 
+                  << " на адрес " << destIP << ":" << port << std::endl;
+
+        // Ищем соответствующий маршрут
+        bool routeFound = false;
+        for (const auto& route : routes) {
+            // Если клиент подключился к IP, указанному в маршруте
+            // или если маршрут использует 0.0.0.0 (все интерфейсы)
+            if (route.sourceIP == "0.0.0.0" || route.sourceIP == "*" || 
+                strcmp(destIP, route.sourceIP.c_str()) == 0) {
+                std::cout << "Найден маршрут для " << destIP << ":" << port 
+                          << " -> " << route.destDomain << ":" << route.destPort << std::endl;
+                
+                // Обрабатываем клиента по найденному маршруту
+                std::thread clientThread(&RouteProxy::handleClient, this, clientSocket, route);
+                clientThread.detach();
+                
+                routeFound = true;
+                break;
+            }
+        }
+
+        if (!routeFound) {
+            std::cerr << "Не найден маршрут для " << destIP << ":" << port << std::endl;
+            close(clientSocket);
+        }
     }
 
     close(serverSocket);
