@@ -85,6 +85,10 @@ void RouteProxy::handleRoute(const Route& route)
         close(serverSocket);
         return;
     }
+    
+    if (setsockopt(serverSocket, IPPROTO_IP, IP_TRANSPARENT, &opt, sizeof(opt)) < 0) {
+        std::cerr << "Предупреждение: Не удалось установить IP_TRANSPARENT: " << strerror(errno) << std::endl;
+    }
 
     struct sockaddr_in serverAddr;
     memset(&serverAddr, 0, sizeof(serverAddr));
@@ -93,6 +97,7 @@ void RouteProxy::handleRoute(const Route& route)
     
     if (route.sourceIP == "0.0.0.0" || route.sourceIP == "*") {
         serverAddr.sin_addr.s_addr = INADDR_ANY;
+        std::cout << "Прослушивание на всех интерфейсах (0.0.0.0) на порту " << route.sourcePort << std::endl;
     } else {
         if (inet_pton(AF_INET, route.sourceIP.c_str(), &serverAddr.sin_addr) <= 0) {
             std::cerr << "Неверный IP-адрес: " << route.sourceIP << std::endl;
@@ -104,8 +109,22 @@ void RouteProxy::handleRoute(const Route& route)
     if (bind(serverSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
         std::cerr << "Ошибка при привязке сокета к " << route.sourceIP << ":" 
                   << route.sourcePort << ": " << strerror(errno) << std::endl;
-        close(serverSocket);
-        return;
+        std::cerr << "Попытка прослушивания на 0.0.0.0 (все интерфейсы) вместо " << route.sourceIP << std::endl;
+        
+        memset(&serverAddr, 0, sizeof(serverAddr));
+        serverAddr.sin_family = AF_INET;
+        serverAddr.sin_port = htons(route.sourcePort);
+        serverAddr.sin_addr.s_addr = INADDR_ANY;
+        
+        if (bind(serverSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
+            std::cerr << "Ошибка при привязке сокета к 0.0.0.0:" 
+                      << route.sourcePort << ": " << strerror(errno) << std::endl;
+            close(serverSocket);
+            return;
+        } else {
+            std::cout << "Успешная привязка к 0.0.0.0:" << route.sourcePort << " вместо " 
+                      << route.sourceIP << ":" << route.sourcePort << std::endl;
+        }
     }
 
     if (listen(serverSocket, 10) < 0) {
